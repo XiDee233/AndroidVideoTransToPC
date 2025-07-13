@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.VideoTrans" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- 支持全屏显示 -->
+        <item name="android:windowFullscreen">false</item>
+        <!-- 支持刘海屏适配 (API 28+) -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <!-- 透明状态栏 -->
+        <item name="android:windowTranslucentStatus">false</item>
+        <!-- 透明导航栏 -->
+        <item name="android:windowTranslucentNavigation">false</item>
+        <!-- 绘制到系统栏后面 -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <!-- 状态栏颜色透明 -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <!-- 导航栏颜色透明 -->
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- 强制边缘到边缘显示 (API 29+) -->
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <!-- 手势导航栏颜色 (API 29+) -->
+        <item name="android:navigationBarDividerColor">@android:color/transparent</item>
+    </style>
+</resources>

@@ -1,0 +1,26 @@
+# GUI框架
+PyQt5==5.15.10
+
+# 计算机视觉
+opencv-python==4.8.1.78
+numpy==1.24.3
+
+# YOLO目标检测
+# ultralytics - 使用本地修改版本，无需从PyPI安装
+torch==2.0.1+cpu
+torchvision==0.15.2+cpu
+torchaudio==2.0.2+cpu
+--find-links https://download.pytorch.org/whl/torch_stable.html
+
+# 网络通信
+Flask==2.3.3
+requests==2.31.0
+
+# 其他依赖
+Pillow==10.0.0
+matplotlib==3.7.2
+scipy==1.11.2
+pandas==2.0.3
+
+# 打包工具
+PyInstaller==5.13.2
