@@ -5,7 +5,7 @@ a = Analysis(
     ['gui_main.py'],
     pathex=[],
     binaries=[],
-    datas=[('yolo11n.pt', '.'), ('best.pt', '.'), ('ultralytics', 'ultralytics')],
+    datas=[('yolo11n.pt', '.'), ('best.pt', '.'), ('best.onnx', '.'), ('ultralytics', 'ultralytics')],
     hiddenimports=['ultralytics', 'ultralytics.models', 'ultralytics.models.yolo', 'ultralytics.engine', 'ultralytics.utils', 'ultralytics.nn.FRFN', 'ultralytics.nn.SEAM', 'cv2', 'numpy', 'torch', 'torchvision', 'PIL', 'flask', 'requests', 'matplotlib', 'matplotlib.pyplot', 'matplotlib.backends', 'matplotlib.backends.backend_agg', 'scipy', 'scipy.optimize', 'scipy.optimize.linear_sum_assignment'],
     hookspath=[],
     hooksconfig={},

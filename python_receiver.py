@@ -32,8 +32,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class AndroidVideoReceiver:
-    def __init__(self, port=9000):
+    def __init__(self, port=9000, gui_mode=False):
         self.port = port
+        self.gui_mode = gui_mode  # 新增GUI模式标志
         self.app = Flask(__name__)
         self.latest_frame = None
         self.frame_queue = queue.Queue(maxsize=500)  
@@ -186,6 +187,13 @@ class AndroidVideoReceiver:
             return adb_path
         
         print("\n❌ 未找到ADB工具")
+        
+        # GUI模式下自动下载ADB
+        if self.gui_mode:
+            print("\n📥 GUI模式：自动下载ADB工具...")
+            return self.auto_download_adb()
+        
+        # 命令行模式下提供选择
         print("\n📥 ADB安装选项:")
         print("1. 自动下载ADB工具 (推荐)")
         print("2. 手动安装Android SDK")

@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import logging  # 添加日志模块
 import queue  # 添加队列模块
+import threading  # 添加线程模块
 from ultralytics import YOLO
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QComboBox, QGroupBox, QSlider)
@@ -45,9 +46,6 @@ class DetectionWorker(QObject):
     error_occurred = pyqtSignal(str)
     status_changed = pyqtSignal(str)
 
-    # 在DetectionWorker类中添加一个新属性来跟踪当前检测到的ID总数
-
-    # 在DetectionWorker类的__init__方法中添加新的计数器属性
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -63,6 +61,11 @@ class DetectionWorker(QObject):
         self.id_colors = {}
         self.show_inactive = True
         self.paused = False
+        
+        # 生产者-消费者队列
+        self.detection_queue = queue.Queue(maxsize=10)  # 检测结果队列
+        self.tracking_thread = None  # 跟踪线程
+        self.tracking_running = False  # 跟踪线程运行状态
         
         # USB手机相关属性
         self.usb_receiver = None
@@ -131,7 +134,7 @@ class DetectionWorker(QObject):
                 time.sleep(0.5)  # 等待服务器完全停止
             
             # 总是重新创建AndroidVideoReceiver实例，确保状态干净
-            self.usb_receiver = AndroidVideoReceiver(port=9000)
+            self.usb_receiver = AndroidVideoReceiver(port=9000, gui_mode=True)
             # 设置ADB端口转发
             adb_ready = self.usb_receiver.setup_adb_port_forwarding()
             if adb_ready:
@@ -176,11 +179,130 @@ class DetectionWorker(QObject):
             logger.error(f"停止USB服务器失败: {str(e)}")
             self.error_occurred.emit(f"停止USB服务器失败: {str(e)}")
 
+    def start_tracking_thread(self):
+        """启动跟踪消费者线程"""
+        if self.tracking_thread is None or not self.tracking_thread.is_alive():
+            self.tracking_running = True
+            self.tracking_thread = threading.Thread(target=self.tracking_consumer, daemon=True)
+            self.tracking_thread.start()
+    
+    def stop_tracking_thread(self):
+        """停止跟踪消费者线程"""
+        self.tracking_running = False
+        # 清空队列并添加停止信号
+        try:
+            while not self.detection_queue.empty():
+                self.detection_queue.get_nowait()
+        except queue.Empty:
+            pass
+        # 添加停止信号
+        try:
+            self.detection_queue.put(None, timeout=0.1)
+        except queue.Full:
+            pass
+        
+        if self.tracking_thread and self.tracking_thread.is_alive():
+             self.tracking_thread.join(timeout=1.0)
+    
+    def tracking_consumer(self):
+        """跟踪消费者线程 - 处理检测结果队列"""
+        while self.tracking_running:
+            try:
+                # 从队列获取检测结果
+                queue_data = self.detection_queue.get(timeout=0.1)
+                
+                # 检查停止信号
+                if queue_data is None:
+                    break
+                
+                frame = queue_data['frame']
+                detections = queue_data['detections']
+                counting_line = queue_data['counting_line']
+                line_direction = queue_data['line_direction']
+                
+                # 更新tracker
+                tracks = self.tracker.update(detections, frame_shape=frame.shape)
+                
+                # 检查是否有物体穿过计数线
+                for track in tracks:
+                    # 添加ID到总ID集合
+                    self.total_ids.add(track['id'])
+                    if self.check_line_crossing(track):
+                        self.counter += 1
+                        
+                # 绘制检测框和轨迹（每个id唯一颜色）
+                annotated_frame = frame.copy()
+                for i, track in enumerate(tracks):
+                    # 判断活跃性
+                    trk_obj = self.tracker.trackers[i] if i < len(self.tracker.trackers) else None
+                    is_active = (trk_obj.lost == 0) if trk_obj else True
+                    if self.show_inactive or is_active:
+                        x1, y1, x2, y2 = map(int, track['bbox'])
+                        color = self.get_color(track['id'])
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(annotated_frame, f"ID:{track['id']}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                # 画轨迹（每个id唯一颜色）
+                for i, track in enumerate(tracks):
+                    trk_obj = self.tracker.trackers[i] if i < len(self.tracker.trackers) else None
+                    is_active = (trk_obj.lost == 0) if trk_obj else True
+                    if self.show_inactive or is_active:
+                        color = self.get_color(track['id'])
+                        trace = track['trace']
+                        if len(trace) > 1:
+                            for j in range(1, len(trace)):
+                                pt1 = (int(trace[j-1][0]), int(trace[j-1][1]))
+                                pt2 = (int(trace[j][0]), int(trace[j][1]))
+                                cv2.line(annotated_frame, pt1, pt2, color, 2)
+                                
+                # 绘制计数线（确保计数线已初始化）
+                if counting_line is not None:
+                    line_color = (0, 0, 255)  # 红色
+                    cv2.line(annotated_frame, counting_line[0], counting_line[1], line_color, 2)
+                
+                # 显示计数和总ID数
+                count_text = f"Total Count: {self.counter}"
+                cv2.putText(annotated_frame, count_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                
+                # 显示当前检测到的总ID数
+                total_ids_text = f"Total IDs: {len(self.total_ids)}"
+                cv2.putText(annotated_frame, total_ids_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                
+                # 显示双向计数结果
+                if line_direction == 'horizontal':
+                    # 显示从上到下和从下到上的计数
+                    top_to_bottom_text = f"Top→Bottom: {self.top_to_bottom_counter}"
+                    bottom_to_top_text = f"Bottom→Top: {self.bottom_to_top_counter}"
+                    cv2.putText(annotated_frame, top_to_bottom_text, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+                    cv2.putText(annotated_frame, bottom_to_top_text, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+                else:  # vertical
+                    # 显示从左到右和从右到左的计数
+                    left_to_right_text = f"Left→Right: {self.left_to_right_counter}"
+                    right_to_left_text = f"Right→Left: {self.right_to_left_counter}"
+                    cv2.putText(annotated_frame, left_to_right_text, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+                    cv2.putText(annotated_frame, right_to_left_text, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+                
+                # 转为RGB并发送
+                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                self.image_ready.emit(rgb_image)
+                
+                # 标记任务完成
+                self.detection_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.error_occurred.emit(f"跟踪处理错误: {str(e)}")
+                break
+
     def stop(self):
         with QMutexLocker(self.mutex):
             self.abort = True
             self.condition.wakeOne()
             self.status_changed.emit("已停止")
+        
+        # 停止跟踪线程
+        self.stop_tracking_thread()
         
         # 在mutex锁外停止USB服务器，避免死锁
         if self.source_type == "usb_phone" and self.usb_server_running:
@@ -223,6 +345,9 @@ class DetectionWorker(QObject):
                 self.restart = False
 
             try:
+                # 启动跟踪消费者线程
+                self.start_tracking_thread()
+                
                 self.status_changed.emit(f"开始检测: {self.source_type}")
                 if self.source_type == "camera":
                     if cap is None:
@@ -404,95 +529,61 @@ class DetectionWorker(QObject):
     # 修改DetectionWorker类中的方法
     
     def process_frame(self, frame):
+        """检测生产者 - 处理单帧图像并将结果放入队列"""
         if self.paused:
             return
             
-        # 初始化或更新计数线位置
-        h, w = frame.shape[:2]
-        with QMutexLocker(self.mutex):
-            if self.line_direction == 'horizontal':
-                y = int(h * self.line_position)
-                self.counting_line = [(0, y), (w, y)]
-            else:  # vertical
-                x = int(w * self.line_position)
-                self.counting_line = [(x, 0), (x, h)]
+        try:
+            # 初始化或更新计数线位置
+            h, w = frame.shape[:2]
+            with QMutexLocker(self.mutex):
+                if self.line_direction == 'horizontal':
+                    y = int(h * self.line_position)
+                    self.counting_line = [(0, y), (w, y)]
+                else:  # vertical
+                    x = int(w * self.line_position)
+                    self.counting_line = [(x, 0), (x, h)]
+                    
+            # 使用YOLO模型进行检测
+            results = self.model.predict(frame, conf=0.5, iou=0.7, imgsz=640)
+            boxes = results[0].boxes
+            dets = []
+            if boxes is not None and len(boxes) > 0:
+                for box in boxes:
+                    conf = float(box.conf[0]) if hasattr(box, 'conf') else 0
+                    if conf < 0.5:
+                        continue
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    cls = int(box.cls[0]) if hasattr(box, 'cls') else 0
+                    dets.append([x1, y1, x2, y2, conf, cls])
+            
+            # 将检测结果和帧信息放入队列供跟踪线程处理
+            queue_data = {
+                'frame': frame.copy(),
+                'detections': dets,
+                'counting_line': self.counting_line,
+                'line_direction': self.line_direction
+            }
+            
+            try:
+                self.detection_queue.put(queue_data, timeout=0.01)
+            except queue.Full:
+                # 队列满时跳过当前帧
+                pass
                 
-        # Use YOLO model for detection
-        results = self.model.predict(frame, conf=0.5, iou=0.7, imgsz=544)
-        boxes = results[0].boxes
-        dets = []
-        if boxes is not None and len(boxes) > 0:
-            for box in boxes:
-                conf = float(box.conf[0]) if hasattr(box, 'conf') else 0
-                if conf < 0.5:
-                    continue
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                cls = int(box.cls[0]) if hasattr(box, 'cls') else 0
-                dets.append([x1, y1, x2, y2, conf, cls])
-        # 更新tracker
-        tracks = self.tracker.update(dets, frame_shape=frame.shape)
-        
-        # 检查是否有物体穿过计数线
-        for track in tracks:
-            # 添加ID到总ID集合
-            self.total_ids.add(track['id'])
-            if self.check_line_crossing(track):
-                self.counter += 1
-                
-        # 绘制检测框和轨迹（每个id唯一颜色）
-        annotated_frame = frame.copy()
-        for i, track in enumerate(tracks):
-            # 判断活跃性
-            trk_obj = self.tracker.trackers[i] if i < len(self.tracker.trackers) else None
-            is_active = (trk_obj.lost == 0) if trk_obj else True
-            if self.show_inactive or is_active:
-                x1, y1, x2, y2 = map(int, track['bbox'])
-                color = self.get_color(track['id'])
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(annotated_frame, f"ID:{track['id']}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        # 画轨迹（每个id唯一颜色）
-        for i, track in enumerate(tracks):
-            trk_obj = self.tracker.trackers[i] if i < len(self.tracker.trackers) else None
-            is_active = (trk_obj.lost == 0) if trk_obj else True
-            if self.show_inactive or is_active:
-                color = self.get_color(track['id'])
-                trace = track['trace']
-                if len(trace) > 1:
-                    for j in range(1, len(trace)):
-                        pt1 = (int(trace[j-1][0]), int(trace[j-1][1]))
-                        pt2 = (int(trace[j][0]), int(trace[j][1]))
-                        cv2.line(annotated_frame, pt1, pt2, color, 2)
-                        
-        # 绘制计数线（确保计数线已初始化）
-        if self.counting_line is not None:
-            line_color = (0, 0, 255)  # 红色
-            cv2.line(annotated_frame, self.counting_line[0], self.counting_line[1], line_color, 2)
-        
-        # 显示计数和总ID数
-        count_text = f"Total Count: {self.counter}"
-        cv2.putText(annotated_frame, count_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-        
-        # 显示当前检测到的总ID数
-        total_ids_text = f"Total IDs: {len(self.total_ids)}"
-        cv2.putText(annotated_frame, total_ids_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        
-        # 显示双向计数结果
-        if self.line_direction == 'horizontal':
-            # 显示从上到下和从下到上的计数
-            top_to_bottom_text = f"Top→Bottom: {self.top_to_bottom_counter}"
-            bottom_to_top_text = f"Bottom→Top: {self.bottom_to_top_counter}"
-            cv2.putText(annotated_frame, top_to_bottom_text, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
-            cv2.putText(annotated_frame, bottom_to_top_text, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
-        else:  # vertical
-            # 显示从左到右和从右到左的计数
-            left_to_right_text = f"Left→Right: {self.left_to_right_counter}"
-            right_to_left_text = f"Right→Left: {self.right_to_left_counter}"
-            cv2.putText(annotated_frame, left_to_right_text, (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
-            cv2.putText(annotated_frame, right_to_left_text, (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
-        
-        # 转为RGB
-        rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-        self.image_ready.emit(rgb_image)
+        except Exception as e:
+            self.error_occurred.emit(f"检测处理错误: {str(e)}")
+            # 发生错误时仍然将原始帧放入队列
+            try:
+                error_data = {
+                    'frame': frame.copy(),
+                    'detections': [],
+                    'counting_line': self.counting_line,
+                    'line_direction': self.line_direction
+                }
+                self.detection_queue.put(error_data, timeout=0.01)
+            except queue.Full:
+                pass
 
 
 class YOLODetectionApp(QMainWindow):
@@ -501,15 +592,53 @@ class YOLODetectionApp(QMainWindow):
         self.setWindowTitle("YOLOv11 对象检测系统")
         self.setGeometry(100, 100, 1200, 800)
 
-        # 加载YOLO模型
-        model_path = get_resource_path("best.pt")
-        self.model = YOLO(model_path)
-
+        # 初始化模型相关属性
+        self.current_model_type = "PyTorch (.pt)"  # 默认模型类型
+        self.model = None
+        self.worker = None
+        self.thread = None
+        
+        # 加载默认YOLO模型
+        self.load_model()
+        
         # 创建检测线程和工作器
+        self.setup_worker()
+
+        self.pause_btn = QPushButton("暂停")
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.is_paused = False
+
+        self.init_ui()
+
+    def load_model(self):
+        """根据当前选择的模型类型加载模型"""
+        try:
+            if self.current_model_type == "PyTorch (.pt)":
+                model_path = get_resource_path("best.pt")
+            else:  # ONNX (.onnx)
+                model_path = get_resource_path("best.onnx")
+            
+            self.model = YOLO(model_path)
+            print(f"成功加载模型: {model_path}")
+        except Exception as e:
+            print(f"加载模型失败: {e}")
+            # 如果ONNX模型加载失败，回退到PyTorch模型
+            if self.current_model_type == "ONNX (.onnx)":
+                print("回退到PyTorch模型")
+                self.current_model_type = "PyTorch (.pt)"
+                model_path = get_resource_path("best.pt")
+                self.model = YOLO(model_path)
+
+    def setup_worker(self):
+        """设置检测工作器和线程"""
+        if self.thread is not None:
+            self.thread.quit()
+            self.thread.wait()
+        
         self.thread = QThread()
         self.worker = DetectionWorker(self.model)
         self.worker.moveToThread(self.thread)
-
+        
         # 连接信号
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.thread.quit)
@@ -518,15 +647,22 @@ class YOLODetectionApp(QMainWindow):
         self.worker.image_ready.connect(self.update_image)
         self.worker.error_occurred.connect(self.show_error)
         self.worker.status_changed.connect(self.update_status)
+        
+        # 不自动启动线程，等待用户点击开始检测
 
-        # 启动线程
-        self.thread.start()
-
-        self.pause_btn = QPushButton("暂停")
-        self.pause_btn.clicked.connect(self.toggle_pause)
-        self.is_paused = False
-
-        self.init_ui()
+    def change_model(self):
+        """切换模型类型"""
+        new_model_type = self.model_combo.currentText()
+        if new_model_type != self.current_model_type:
+            # 停止当前检测
+            if self.worker and self.worker.running:
+                self.stop_detection()
+            
+            self.current_model_type = new_model_type
+            self.load_model()
+            self.setup_worker()
+            
+            self.update_status(f"已切换到 {new_model_type} 模型")
 
     def init_ui(self):
         # 创建主部件和布局
@@ -540,6 +676,11 @@ class YOLODetectionApp(QMainWindow):
         self.source_combo = QComboBox()
         self.source_combo.addItems(["摄像头", "视频文件", "图片文件", "USB手机"])
         self.source_combo.currentIndexChanged.connect(self.reset_ui)
+
+        # 模型类型选择
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(["PyTorch (.pt)", "ONNX (.onnx)"])
+        self.model_combo.currentIndexChanged.connect(self.change_model)
 
         self.start_btn = QPushButton("开始检测")
         self.start_btn.clicked.connect(self.start_detection)
@@ -558,6 +699,8 @@ class YOLODetectionApp(QMainWindow):
 
         control_layout.addWidget(QLabel("输入源:"))
         control_layout.addWidget(self.source_combo)
+        control_layout.addWidget(QLabel("模型类型:"))
+        control_layout.addWidget(self.model_combo)
         control_layout.addWidget(self.start_btn)
         control_layout.addWidget(self.stop_btn)
         control_layout.addWidget(self.pause_btn)
@@ -663,6 +806,10 @@ class YOLODetectionApp(QMainWindow):
 
         # 设置新的检测任务
         self.worker.set_source(source_type, file_path)
+        
+        # 启动线程
+        if not self.thread.isRunning():
+            self.thread.start()
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
